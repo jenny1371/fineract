@@ -31,10 +31,13 @@ import java.time.LocalDate;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import org.apache.fineract.avro.MessageV1;
 import org.apache.fineract.infrastructure.businessdate.domain.BusinessDateType;
@@ -305,6 +308,118 @@ class SendAsynchronousEventsTaskletTest {
         Awaitility.await().atMost(10L, TimeUnit.SECONDS).untilAsserted(() -> verify(repository)
                 .markEventsSent(Mockito.eq(firstBatch.stream().map(ExternalEventView::getId).toList()), Mockito.any()));
         verify(repository, times(1)).markEventsSent(Mockito.any(), Mockito.any());
+        assertEquals(RepeatStatus.FINISHED, resultStatus);
+    }
+
+    // ---- parallel message creation ---------------------------------------------------------------------------------
+
+    private SendAsynchronousEventsTasklet taskletWithParallelCreation(boolean enabled, int workers) {
+        FineractProperties.FineractExternalEventsProperties external = fineractProperties.getEvents().getExternal();
+        external.setParallelMessageCreation(enabled);
+        external.setThreadPoolCorePoolSize(workers);
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(workers);
+        executor.setMaxPoolSize(workers);
+        executor.initialize();
+        return new SendAsynchronousEventsTasklet(fineractProperties, repository, eventProducer, messageFactory, byteBufferConverter,
+                configurationDomainService, transactionTemplate, executor);
+    }
+
+    /** 6 aggregates x 4 events each, in an interleaved order (a1, a2, ... a6, a1, a2, ...). */
+    private List<ExternalEventView> interleavedEvents() {
+        List<ExternalEventView> events = new ArrayList<>();
+        for (int round = 0; round < 4; round++) {
+            for (long aggregate = 1; aggregate <= 6; aggregate++) {
+                events.add(
+                        createExternalEventView("aType", "aCategory", "aSchema", new byte[0], "key-" + aggregate + "-" + round, aggregate));
+            }
+        }
+        return events;
+    }
+
+    private void stubMessageCreationThatRecords(Map<Long, List<Long>> createdOrderPerAggregate, List<String> threadNames,
+            List<Object> tenantsSeen) throws Exception {
+        when(messageFactory.createMessage(Mockito.any())).thenAnswer(invocation -> {
+            ExternalEventView event = invocation.getArgument(0);
+            createdOrderPerAggregate.computeIfAbsent(event.getAggregateRootId(), k -> Collections.synchronizedList(new ArrayList<>()))
+                    .add(event.getId());
+            threadNames.add(Thread.currentThread().getName());
+            tenantsSeen.add(ThreadLocalContextUtil.getTenant());
+            return new MessageV1(event.getId(), "aSource", "aType", "nocategory", "aCreateDate", "aBusinessDate", "aTenantId",
+                    "anidempotencyKey", "aSchema", ByteBuffer.wrap("dummy".getBytes(StandardCharsets.UTF_8)));
+        });
+        when(byteBufferConverter.convert(Mockito.any(ByteBuffer.class))).thenReturn(new byte[0]);
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    public void givenParallelCreationWhenManyAggregatesThenEveryEventIsSentPerAggregateAndInTheirOriginalOrder() throws Exception {
+        // given
+        SendAsynchronousEventsTasklet parallel = taskletWithParallelCreation(true, 3);
+        List<ExternalEventView> events = interleavedEvents();
+        Map<Long, List<Long>> created = new ConcurrentHashMap<>();
+        stubMessageCreationThatRecords(created, new CopyOnWriteArrayList<>(), new CopyOnWriteArrayList<>());
+        when(repository.findByStatusOrderByBusinessDateAscIdAsc(Mockito.any(), Mockito.any())).thenReturn(events);
+        // when
+        resultStatus = parallel.execute(stepContribution, chunkContext);
+        // then: every aggregate got exactly its 4 events, created in the order they were queued
+        ArgumentCaptor<Map<Long, List<byte[]>>> sent = ArgumentCaptor.forClass(Map.class);
+        verify(eventProducer).sendEvents(sent.capture());
+        assertThat(sent.getValue().keySet()).containsExactlyInAnyOrder(1L, 2L, 3L, 4L, 5L, 6L);
+        sent.getValue().values().forEach(messages -> assertThat(messages).hasSize(4));
+        for (long aggregate = 1; aggregate <= 6; aggregate++) {
+            long id = aggregate;
+            List<Long> expectedOrder = events.stream().filter(e -> e.getAggregateRootId() == id).map(ExternalEventView::getId).toList();
+            assertThat(created.get(aggregate)).as("creation order of aggregate %d", aggregate).containsExactlyElementsOf(expectedOrder);
+        }
+        assertEquals(RepeatStatus.FINISHED, resultStatus);
+    }
+
+    @Test
+    public void givenParallelCreationThenWorkerThreadsSeeTheTenantContextAndWorkIsOffTheCallingThread() throws Exception {
+        // given
+        SendAsynchronousEventsTasklet parallel = taskletWithParallelCreation(true, 3);
+        List<String> threadNames = new CopyOnWriteArrayList<>();
+        List<Object> tenantsSeen = new CopyOnWriteArrayList<>();
+        stubMessageCreationThatRecords(new ConcurrentHashMap<>(), threadNames, tenantsSeen);
+        List<ExternalEventView> events = interleavedEvents();
+        when(repository.findByStatusOrderByBusinessDateAscIdAsc(Mockito.any(), Mockito.any())).thenReturn(events);
+        String callingThread = Thread.currentThread().getName();
+        // when
+        parallel.execute(stepContribution, chunkContext);
+        // then: message creation reads the tenant from a ThreadLocal; it must be present on every worker thread
+        assertThat(tenantsSeen).hasSize(24).doesNotContainNull();
+        assertThat(threadNames).doesNotContain(callingThread);
+    }
+
+    @Test
+    public void givenParallelCreationDisabledThenMessagesAreCreatedOnTheCallingThread() throws Exception {
+        // given: the default (off), even with several worker threads available
+        SendAsynchronousEventsTasklet sequential = taskletWithParallelCreation(false, 3);
+        List<String> threadNames = new CopyOnWriteArrayList<>();
+        stubMessageCreationThatRecords(new ConcurrentHashMap<>(), threadNames, new CopyOnWriteArrayList<>());
+        List<ExternalEventView> events = interleavedEvents();
+        when(repository.findByStatusOrderByBusinessDateAscIdAsc(Mockito.any(), Mockito.any())).thenReturn(events);
+        // when
+        sequential.execute(stepContribution, chunkContext);
+        // then
+        assertThat(threadNames).hasSize(24).containsOnly(Thread.currentThread().getName());
+    }
+
+    @Test
+    public void givenParallelCreationWhenOneAggregateFailsThenNothingIsSentOrMarkedAsSent() throws Exception {
+        // given
+        SendAsynchronousEventsTasklet parallel = taskletWithParallelCreation(true, 3);
+        stubMessageCreationThatRecords(new ConcurrentHashMap<>(), new CopyOnWriteArrayList<>(), new CopyOnWriteArrayList<>());
+        Mockito.doThrow(new IllegalStateException("cannot serialize")).when(messageFactory)
+                .createMessage(Mockito.argThat(e -> e != null && Long.valueOf(4L).equals(e.getAggregateRootId())));
+        List<ExternalEventView> events = interleavedEvents();
+        when(repository.findByStatusOrderByBusinessDateAscIdAsc(Mockito.any(), Mockito.any())).thenReturn(events);
+        // when
+        resultStatus = parallel.execute(stepContribution, chunkContext);
+        // then: the whole batch stays TO_BE_SENT, as when a sequential creation fails
+        verify(eventProducer, times(0)).sendEvents(Mockito.any());
+        verify(repository, times(0)).markEventsSent(Mockito.any(), Mockito.any());
         assertEquals(RepeatStatus.FINISHED, resultStatus);
     }
 

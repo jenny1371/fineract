@@ -339,6 +339,11 @@ public class FineractProperties {
          * soon as a batch is not full.
          */
         private int maxBatchesPerRun = 1;
+        /**
+         * Create the messages of different aggregates concurrently (see thread-pool-core-pool-size). Events of one
+         * aggregate are still created in order by one task. Off by default.
+         */
+        private boolean parallelMessageCreation;
     }
 
     @Getter

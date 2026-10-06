@@ -27,6 +27,8 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
@@ -168,12 +170,64 @@ public class SendAsynchronousEventsTasklet implements Tasklet {
             }
             return aggregateRootId;
         }));
-        Map<Long, List<byte[]>> partitions = measure(
-                () -> initialPartitions.entrySet().stream().collect(toMap(Map.Entry::getKey, e -> createMessages(e.getValue()))),
-                timeTaken -> {
-                    log.debug("Took {}ms to create message partitions", timeTaken.toMillis());
-                });
+        Map<Long, List<byte[]>> partitions = measure(() -> createMessagesPerAggregate(initialPartitions), timeTaken -> {
+            log.debug("Took {}ms to create message partitions", timeTaken.toMillis());
+        });
         return partitions;
+    }
+
+    /**
+     * Creates the messages of all aggregates. With {@code parallel-message-creation} enabled the aggregates are spread
+     * over the worker threads (at most {@code thread-pool-core-pool-size} tasks). The events of one aggregate are
+     * always created one after the other, in order, by a single task, so the per-aggregate ordering that the Kafka key
+     * (the aggregate root id) relies on is unchanged. Message creation reads the tenant from a ThreadLocal, so the
+     * context is handed to each worker thread, exactly like {@link #markEventsAsSent(List)} does.
+     */
+    private Map<Long, List<byte[]>> createMessagesPerAggregate(Map<Long, List<ExternalEventView>> eventsByAggregate) {
+        FineractProperties.FineractExternalEventsProperties properties = fineractProperties.getEvents().getExternal();
+        int tasks = Math.min(properties.getThreadPoolCorePoolSize(), eventsByAggregate.size());
+        if (!properties.isParallelMessageCreation() || tasks <= 1) {
+            return eventsByAggregate.entrySet().stream().collect(toMap(Map.Entry::getKey, e -> createMessages(e.getValue())));
+        }
+
+        List<Map<Long, List<ExternalEventView>>> chunks = new ArrayList<>();
+        for (int i = 0; i < tasks; i++) {
+            chunks.add(new LinkedHashMap<>());
+        }
+        int index = 0;
+        for (Map.Entry<Long, List<ExternalEventView>> entry : eventsByAggregate.entrySet()) {
+            chunks.get(index++ % tasks).put(entry.getKey(), entry.getValue());
+        }
+
+        final FineractContext context = ThreadLocalContextUtil.getContext();
+        List<Future<Map<Long, List<byte[]>>>> futures = new ArrayList<>();
+        for (Map<Long, List<ExternalEventView>> chunk : chunks) {
+            futures.add(threadPoolTaskExecutor.submit(() -> {
+                try {
+                    ThreadLocalContextUtil.init(context);
+                    Map<Long, List<byte[]>> created = new HashMap<>();
+                    chunk.forEach((aggregateId, events) -> created.put(aggregateId, createMessages(events)));
+                    return created;
+                } finally {
+                    ThreadLocalContextUtil.reset();
+                }
+            }));
+        }
+
+        Map<Long, List<byte[]>> result = new HashMap<>();
+        try {
+            for (Future<Map<Long, List<byte[]>>> future : futures) {
+                result.putAll(future.get());
+            }
+        } catch (InterruptedException e) {
+            futures.forEach(f -> f.cancel(true));
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted while creating the messages", e);
+        } catch (ExecutionException e) {
+            futures.forEach(f -> f.cancel(true));
+            throw new RuntimeException("Error while creating the messages", e.getCause());
+        }
+        return result;
     }
 
     private List<byte[]> createMessages(List<ExternalEventView> events) {
