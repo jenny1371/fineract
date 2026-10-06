@@ -794,6 +794,7 @@ public class FineractProperties {
                 private Integer maxAttempts;
                 private Boolean enableExponentialBackoff;
                 private Double exponentialBackoffMultiplier;
+                private Double exponentialBackoffJitter;
                 private Duration waitDuration;
 
             }
