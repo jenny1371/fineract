@@ -68,6 +68,10 @@ import org.springframework.stereotype.Component;
 @RequiredArgsConstructor
 public class SavingsAccountTransactionDataValidator {
 
+    // transaction amounts are stored as numeric(19,6): a larger value fails in the database and was answered with a 403
+    // and the SQL error
+    private static final BigDecimal MAX_TRANSACTION_AMOUNT = new BigDecimal("9999999999999");
+
     private static final String IS_BULK_PARAM_NAME = "isBulk";
     private static final String IS_POST_INTEREST_AS_ON_PARAM_NAME = "isPostInterestAsOn";
     private static final String POST_INTEREST_MANUAL_OR_AUTOMATIC_PARAM_NAME = "postInterestManualOrAutomatic";
@@ -127,7 +131,8 @@ public class SavingsAccountTransactionDataValidator {
         baseDataValidator.reset().parameter(transactionDateParamName).value(transactionDate).notNull();
 
         final BigDecimal transactionAmount = this.fromApiJsonHelper.extractBigDecimalWithLocaleNamed(transactionAmountParamName, element);
-        baseDataValidator.reset().parameter(transactionAmountParamName).value(transactionAmount).notNull().positiveAmount();
+        baseDataValidator.reset().parameter(transactionAmountParamName).value(transactionAmount).notNull().positiveAmount()
+                .notGreaterThanMax(MAX_TRANSACTION_AMOUNT);
 
         final String externalId = this.fromApiJsonHelper.extractStringNamed(externalIdParamName, element);
         baseDataValidator.reset().parameter(externalIdParamName).value(externalId).ignoreIfNull().notExceedingLengthOf(100);

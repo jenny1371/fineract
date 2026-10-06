@@ -1000,6 +1000,26 @@ public class SavingsAccount extends AbstractAuditableWithUTCDateTimeCustom<Long>
                 relaxingDaysConfigForPivotDate, refNo);
     }
 
+    /**
+     * An amount such as 0.005 passes the "positive amount" validation but is rounded to the currency's decimal places
+     * when the money is created. Without this check the request would be answered with 200 and a transaction of 0.00
+     * would be posted.
+     */
+    void validateAmountIsNotZeroAfterRounding(final Money amount, final SavingsAccountTransactionDTO transactionDTO,
+            final String resourceTypeName) {
+        if (!amount.isGreaterThanZero()) {
+            final String defaultUserMessage = "The transaction amount " + transactionDTO.getTransactionAmount()
+                    + " is zero after rounding to " + this.currency.getDigitsAfterDecimal() + " decimal places of the currency "
+                    + this.currency.getCode() + ".";
+            final ApiParameterError error = ApiParameterError.parameterError(
+                    "error.msg." + resourceTypeName + ".transaction.amount.is.zero.after.rounding", defaultUserMessage, "transactionAmount",
+                    transactionDTO.getTransactionAmount());
+            final List<ApiParameterError> dataValidationErrors = new ArrayList<>();
+            dataValidationErrors.add(error);
+            throw new PlatformApiDataValidationException(dataValidationErrors);
+        }
+    }
+
     public SavingsAccountTransaction deposit(final SavingsAccountTransactionDTO transactionDTO,
             final SavingsAccountTransactionType savingsAccountTransactionType, final boolean backdatedTxnsAllowedTill,
             final Long relaxingDaysConfigForPivotDate, final String refNo) {
@@ -1046,6 +1066,7 @@ public class SavingsAccount extends AbstractAuditableWithUTCDateTimeCustom<Long>
         validateActivityNotBeforeClientOrGroupTransferDate(SavingsEvent.SAVINGS_DEPOSIT, transactionDTO.getTransactionDate());
 
         final Money amount = Money.of(this.currency, transactionDTO.getTransactionAmount());
+        validateAmountIsNotZeroAfterRounding(amount, transactionDTO, resourceTypeName);
 
         final SavingsAccountTransaction transaction = SavingsAccountTransaction.deposit(this, office(), transactionDTO.getPaymentDetail(),
                 transactionDTO.getTransactionDate(), amount, savingsAccountTransactionType, refNo);
@@ -1183,6 +1204,7 @@ public class SavingsAccount extends AbstractAuditableWithUTCDateTimeCustom<Long>
         }
 
         final Money transactionAmountMoney = Money.of(this.currency, transactionDTO.getTransactionAmount());
+        validateAmountIsNotZeroAfterRounding(transactionAmountMoney, transactionDTO, depositAccountType().resourceName());
         final SavingsAccountTransaction transaction = SavingsAccountTransaction.withdrawal(this, office(),
                 transactionDTO.getPaymentDetail(), transactionDTO.getTransactionDate(), transactionAmountMoney, refNo);
 
